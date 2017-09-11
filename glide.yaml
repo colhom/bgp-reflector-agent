@@ -1,0 +1,15 @@
+package: github.com/coreos/bgp-reflector-agent
+import:
+- package: github.com/golang/glog
+- package: k8s.io/apimachinery
+  subpackages:
+  - pkg/api/errors
+  - pkg/apis/meta/v1
+- package: k8s.io/client-go
+  version: db8228460e2de17f5d3a9a453f61dde0ba86545a
+  subpackages:
+  - kubernetes
+  - rest
+  - tools/leaderelection
+  - tools/leaderelection/resourcelock
+  - tools/record
