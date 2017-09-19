@@ -264,7 +264,7 @@ func (r *Reconciler) syncSubnetReflectors() {
 
 	actionLog := map[string]int{
 		"noop":        0,
-		"existing":    0,
+		"kept":        0,
 		"activated":   0,
 		"deactivated": 0,
 	}
@@ -291,52 +291,37 @@ func (r *Reconciler) syncSubnetReflectors() {
 			if _, ok := reflectorCounts[network]; !ok {
 				reflectorCounts[network] = 0
 			}
-
-			glog.Infof("[%s] examining node %s", network, node.Name)
-
 			if nodeReady(node) {
-
-				// Node is healthy
-				glog.Infof("  * %s is ready!", node.Name)
 				if reflectorCounts[network] < reflectorsPerSubnet {
 					// We haven't seen enough healthy reflectors for this subnet yet...
 					if reflector == "subnet" {
-						glog.Infof(" -> [%s] recognized existing reflector %s", node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel], node.Name)
-						actionTaken = "existing"
+						actionTaken = "kept"
 					} else {
-						glog.Infof(" -> [%s] activating new reflector %s", network, node.Name)
 						node.Labels[libcalicostub.NodeBgpReflectorLabel] = "subnet"
 						actionTaken = "activated"
 					}
 				} else {
 					// We have already seen desired number of reflectors for this subnet
 					if reflector == "subnet" {
-						glog.Infof(" -> [%s] deactivating superfluous reflector %s", network, node.Name)
 						delete(node.Labels, libcalicostub.NodeBgpReflectorLabel)
 						actionTaken = "deactivated"
 					} else {
-						glog.Infof(" -> [%s] no action taken for healthy node %s", network, node.Name)
 						actionTaken = "noop"
 					}
 				}
-
 			} else {
-
 				// Node not healthy --> make sure we're not already relying on it to be a reflector
-				glog.Infof("  * %s is not ready!", node.Name)
 				if reflector == "subnet" {
-					glog.Infof(" -> [%s] deactivating unhealthy reflector %s", network, node.Name)
 					delete(node.Labels, libcalicostub.NodeBgpReflectorLabel)
 					actionTaken = "deactivated"
 				} else {
-					glog.Infof(" -> [%s] no action taken for unhealthy node %s", network, node.Name)
 					actionTaken = "noop"
 				}
 			}
-
+			glog.Infof("[ %-21s ] node: %-30s , ready?: %-6t , action: %-15s", network, node.Name, nodeReady(node), actionTaken)
 			if _, err := r.clientset.CoreV1().Nodes().Update(node); err == nil {
 				switch actionTaken {
-				case "activated", "existing":
+				case "activated", "kept":
 					reflectorCounts[network]++
 				case "noop", "deactivated":
 					//Lack of increment expresses this
@@ -346,7 +331,7 @@ func (r *Reconciler) syncSubnetReflectors() {
 				actionLog[actionTaken]++
 				nodeCounts[network]++
 
-				glog.Infof("[%s] node %s updated", network, node.Name)
+				glog.Infof("[ %-21s ] node %-30s updated", network, node.Name)
 				break
 			} else {
 				if !apierrors.IsConflict(err) {
@@ -367,14 +352,14 @@ func (r *Reconciler) syncSubnetReflectors() {
 	tbl := bytes.Buffer{}
 	tbl.WriteString(fmt.Sprintf(`
 Summary:
- * kept %d existing reflector nodes
- * added %d new reflector nodes
- * removed %d existing reflector nodes
- * observed %d non-reflecting nodes
+ * kept %d reflector nodes as-is
+ * activated %d reflector nodes
+ * deactivated %d reflector nodes
+ * left %d non-reflector nodes as-is
  -----------------------------------------
   Node Subnet CIDR   | Nodes | Reflectors
  -----------------------------------------
-`, actionLog["existing"], actionLog["activated"], actionLog["deactivated"], actionLog["noop"]))
+`, actionLog["kept"], actionLog["activated"], actionLog["deactivated"], actionLog["noop"]))
 
 	for network := range nodeCounts {
 		tbl.WriteString(fmt.Sprintf(
