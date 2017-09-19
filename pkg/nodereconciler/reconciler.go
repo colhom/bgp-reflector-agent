@@ -19,9 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/watch"
 
-	"encoding/json"
-
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	metav1unstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/conversion/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	informersv1 "k8s.io/client-go/informers/core/v1"
@@ -162,15 +161,11 @@ func (r *Reconciler) Run(stopCh <-chan struct{}) {
 					defaultRPS.Kind = libcalicostub.GlobalBGPConfigResourceName
 					defaultRPS.APIVersion = libcalicostub.GroupVersion.String()
 
-					jsonBytes, err := json.Marshal(&defaultRPS)
+					uObj, err := unstructured.DefaultConverter.ToUnstructured(&defaultRPS)
 					if err != nil {
-						glog.Fatalf("error marshaling json: %v", err)
+						glog.Fatalf("error converting to unstructured: %v", err)
 					}
-					uObj := &unstructured.Unstructured{}
-					if err := uObj.UnmarshalJSON(jsonBytes); err != nil {
-						glog.Fatalf("error unmarshaling json: %v", err)
-					}
-					if _, err := crdResource.Create(uObj); err != nil {
+					if _, err := crdResource.Create(&metav1unstructured.Unstructured{Object: uObj}); err != nil {
 						glog.Fatalf("error creating globalbgpconfig: %v", err)
 					}
 				} else {
@@ -411,16 +406,10 @@ func (r *Reconciler) getReflectorsPerSubnet() (int, error) {
 		return 0, err
 	}
 
-	jsonBytes, err := ures.MarshalJSON()
-	if err != nil {
-		return 0, err
+	res := &libcalicostub.GlobalBGPConfig{}
+	if err := unstructured.DefaultConverter.FromUnstructured(ures.Object, res); err != nil {
+		glog.Fatalf("error converting from unstructured: %v", err)
 	}
-
-	res := libcalicostub.GlobalBGPConfig{}
-	if err := json.Unmarshal(jsonBytes, &res); err != nil {
-		return 0, err
-	}
-
 	cnt, err := strconv.Atoi(res.Spec.Value)
 	if err != nil {
 		return 0, fmt.Errorf("Non-integer value %s specified for %s/%s", res.Spec.Value, res.Kind, res.Name)
