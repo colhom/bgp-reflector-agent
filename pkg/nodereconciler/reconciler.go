@@ -3,7 +3,6 @@ package nodereconciler
 import (
 	"bytes"
 	"fmt"
-	"sync"
 	"time"
 
 	"reflect"
@@ -110,118 +109,109 @@ func NewReconciler(
 }
 
 func (r *Reconciler) Run(stopCh <-chan struct{}) {
+	defer glog.Info("reconciler: Run() - all stop channels closed")
+
+	glog.Info("reconciler: starting reconciliation loop")
 	defer close(r.triggerQueue)
 	go r.reconciliationLoop()
 
-	var stopWatch func(bool)
-	var startWatch func() bool
-	var doWatch func()
+	glog.Info("reconciler: starting node informer loop")
+	informerStop := make(chan struct{})
+	defer close(informerStop)
+	go r.nodeInformer.Informer().Run(informerStop)
 
-	{
-		globalbcLock := &sync.Mutex{}
-		var globalbcWatch watch.Interface
-		watchTerminated := false
+	glog.Info("reconciler: starting crd watch loop")
+	crdWatchStop := make(chan struct{})
+	defer close(crdWatchStop)
+	go r.watchCRD(crdWatchStop)
 
-		stopWatch = func(terminate bool) {
-			globalbcLock.Lock()
-			defer globalbcLock.Unlock()
-			glog.Info("reconciler: stop rps watch")
+	glog.Info("reconciler: Run() waiting on stop signal")
+	<-stopCh
+	glog.Info("reconciler: Run() caught stop signal. waiting on stop channels")
+}
 
-			watchTerminated = terminate
-			if globalbcWatch != nil {
-				globalbcWatch.Stop()
-				globalbcWatch = nil
-			}
+func (r *Reconciler) watchCRD(stopCh <-chan struct{}) {
+	terminated := false
+	for !terminated {
+		glog.Info("reconciler: creating new crd watch")
+		crdWatch := r.newCRDWatch()
+		doneCh := make(chan struct{})
+		go r.consumeCRDEvents(crdWatch.ResultChan(), doneCh)
+		select {
+		case <-stopCh:
+			glog.Info("reconciler: crd watch stop signal received")
+			terminated = true
+			crdWatch.Stop()
+			<-doneCh
+		case <-doneCh:
+			glog.Info("reconciler: crd watch done, will restart")
 		}
+	}
+	glog.Info("reconciler: crd watch terminated")
+}
 
-		startWatch = func() bool {
-			globalbcLock.Lock()
-			defer globalbcLock.Unlock()
-			if watchTerminated {
-				return false
+func (r *Reconciler) newCRDWatch() watch.Interface {
+	glog.Info("reconciler: creating new crd watch")
+	crdResource := r.crdClient.Resource(&metav1.APIResource{
+		Name: libcalicostub.GlobalBGPConfigCRDName,
+		Kind: libcalicostub.GlobalBGPConfigResourceName,
+	}, v1.NamespaceAll)
+
+	if _, err := crdResource.Get(libcalicostub.ReflectorsPerSubnetName, metav1.GetOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			glog.Warningf("could not find reflectorspersubnet globalbgpconfig: %v", err)
+			glog.Warning("creating default reflectorspersubnet globalbgpconfig")
+
+			defaultRPS := libcalicostub.GlobalBGPConfig{
+				Spec: libcalicostub.GlobalBGPConfigSpec{
+					Name:  libcalicostub.ReflectorsPerSubnetProperName,
+					Value: "2",
+				},
 			}
-			glog.Info("reconciler: start rps watch")
-			crdResource := r.crdClient.Resource(&metav1.APIResource{
-				Name: libcalicostub.GlobalBGPConfigCRDName,
-				Kind: libcalicostub.GlobalBGPConfigResourceName,
-			}, v1.NamespaceAll)
+			defaultRPS.Name = libcalicostub.ReflectorsPerSubnetName
+			defaultRPS.Kind = libcalicostub.GlobalBGPConfigResourceName
+			defaultRPS.APIVersion = libcalicostub.GroupVersion.String()
 
-			if _, err := crdResource.Get(libcalicostub.ReflectorsPerSubnetName, metav1.GetOptions{}); err != nil {
-				if apierrors.IsNotFound(err) {
-					glog.Warningf("could not find reflectorspersubnet globalbgpconfig: %v", err)
-					glog.Warning("creating default reflectorspersubnet globalbgpconfig")
-
-					defaultRPS := libcalicostub.GlobalBGPConfig{
-						Spec: libcalicostub.GlobalBGPConfigSpec{
-							Name:  libcalicostub.ReflectorsPerSubnetProperName,
-							Value: "2",
-						},
-					}
-					defaultRPS.Name = libcalicostub.ReflectorsPerSubnetName
-					defaultRPS.Kind = libcalicostub.GlobalBGPConfigResourceName
-					defaultRPS.APIVersion = libcalicostub.GroupVersion.String()
-
-					uObj, err := unstructured.DefaultConverter.ToUnstructured(&defaultRPS)
-					if err != nil {
-						glog.Fatalf("error converting to unstructured: %v", err)
-					}
-					if _, err := crdResource.Create(&metav1unstructured.Unstructured{Object: uObj}); err != nil {
-						glog.Fatalf("error creating globalbgpconfig: %v", err)
-					}
-				} else {
-					glog.Fatalf("error getting reflectorspersubnet: %v", err)
-				}
-			}
-
-			//Watch
-			var err error
-			globalbcWatch, err = crdResource.Watch(metav1.ListOptions{})
+			uObj, err := unstructured.DefaultConverter.ToUnstructured(&defaultRPS)
 			if err != nil {
-				glog.Fatalf("error creating globalbgpconfig watch: %v", err)
+				glog.Fatalf("error converting to unstructured: %v", err)
 			}
-
-			return true
-		}
-
-		doWatch = func() {
-			for startWatch() {
-				evtChan := globalbcWatch.ResultChan()
-				for {
-					evt := <-evtChan
-					if evt.Type != "" {
-						if evt.Type == watch.Error {
-							glog.Errorf("globalbgpconfig watch detected error: %+v", evt)
-							break
-						}
-						cfg, ok := evt.Object.(*libcalicostub.GlobalBGPConfig)
-						if !ok {
-							glog.Fatalf("could not cast event object as libcalicostub.GlobalBGPConfig: %+v", evt)
-						}
-						glog.Infof("reconciler: watch event received for %s/%s", cfg.Kind, cfg.Name)
-						switch cfg.Name {
-						case libcalicostub.ReflectorsPerSubnetName:
-							glog.Info("reconciler: watch event triggered re-sync")
-							r.triggerResync()
-						default:
-							glog.Info("reconciler: watch event ignored")
-						}
-					} else {
-						glog.Info("reconciler: globalbgpconfig watch done")
-						break
-					}
-				}
-				stopWatch(false)
+			if _, err := crdResource.Create(&metav1unstructured.Unstructured{Object: uObj}); err != nil {
+				glog.Fatalf("error creating globalbgpconfig: %v", err)
 			}
-			glog.Info("reconciler: globalbgpconfig watch terminated")
+		} else {
+			glog.Fatalf("error getting reflectorspersubnet: %v", err)
 		}
 	}
 
-	defer stopWatch(true)
-	go doWatch()
+	crdWatch, err := crdResource.Watch(metav1.ListOptions{})
+	if err != nil {
+		glog.Fatalf("error creating crd watch: %v", err)
+	}
+	return crdWatch
+}
 
-	glog.Info("reconciler: starting informer loop")
-	r.nodeInformer.Informer().Run(stopCh)
-	glog.Info("reconciler: informer loop done")
+func (r *Reconciler) consumeCRDEvents(evtChan <-chan watch.Event, doneCh chan<- struct{}) {
+	defer close(doneCh)
+	glog.Info("reconciler: reading crd watch event channel")
+	for evt := range evtChan {
+		if evt.Type == watch.Error {
+			glog.Fatalf("globalbgpconfig crd watch detected error: %+v", evt)
+		}
+		cfg, ok := evt.Object.(*libcalicostub.GlobalBGPConfig)
+		if !ok {
+			glog.Fatalf("could not cast event object as libcalicostub.GlobalBGPConfig: %+v", evt)
+		}
+		glog.Infof("reconciler: crd watch event received for %s/%s", cfg.Kind, cfg.Name)
+		switch cfg.Name {
+		case libcalicostub.ReflectorsPerSubnetName: //add additional globalbgpconfig types to this case
+			glog.Info("reconciler: crd watch event triggered re-sync")
+			r.triggerResync()
+		default:
+			glog.Info("reconciler: crd watch event ignored")
+		}
+	}
+	glog.Info("reconciler: crd watch event channel closed")
 }
 
 func (r *Reconciler) triggerResync() {
