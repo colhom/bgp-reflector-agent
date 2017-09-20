@@ -207,7 +207,7 @@ func (r *Reconciler) syncSubnetReflectors() {
 			network, ok := node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel]
 			if !ok {
 				glog.Warningf("node %s is missing %s label! Will skip this node....", node.Name, libcalicostub.NodeBgpIpv4NetworkLabel)
-				continue
+				break
 			}
 
 			reflector := node.Labels[libcalicostub.NodeBgpReflectorLabel]
