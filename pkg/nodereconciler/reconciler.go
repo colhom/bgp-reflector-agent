@@ -5,26 +5,21 @@ import (
 	"fmt"
 	"time"
 
-	"reflect"
 	"strconv"
 
+	"github.com/coreos/bgp-reflector-agent/pkg/k8sutil"
 	"github.com/coreos/bgp-reflector-agent/pkg/libcalicostub"
 	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/apimachinery/pkg/watch"
 
-	metav1unstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/conversion/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	informersv1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
@@ -74,7 +69,7 @@ func NewReconciler(
 
 	nodeInformer := informerFactory.Core().V1().Nodes()
 
-	crdClient, err := buildCRDClientV1(*config)
+	crdClient, err := k8sutil.BuildCRDClientV1(*config)
 	if err != nil {
 		glog.Fatalf("error building crd dynamic client: %v", err)
 	}
@@ -94,7 +89,7 @@ func NewReconciler(
 				reconciler.triggerResync()
 			},
 			UpdateFunc: func(oldNode, newNode interface{}) {
-				if relevantStateChanged(castNode(oldNode), castNode(newNode)) {
+				if relevantStateChanged(k8sutil.MustCastNode(oldNode), k8sutil.MustCastNode(newNode)) {
 					glog.Info("reconciler: node update trigger")
 					reconciler.triggerResync()
 				}
@@ -120,98 +115,25 @@ func (r *Reconciler) Run(stopCh <-chan struct{}) {
 	defer close(informerStop)
 	go r.nodeInformer.Informer().Run(informerStop)
 
-	glog.Info("reconciler: starting crd watch loop")
-	crdWatchStop := make(chan struct{})
-	defer close(crdWatchStop)
-	go r.watchCRD(crdWatchStop)
+	glog.Info("reconciler: starting globalbgpconfig watch loop")
+	gbcWatchStop := make(chan struct{})
+	defer close(gbcWatchStop)
+	go k8sutil.WatchGlobalBGPConfigs(r.crdClient, r.globalBGPConfigHandler, gbcWatchStop)
 
 	glog.Info("reconciler: Run() waiting on stop signal")
 	<-stopCh
 	glog.Info("reconciler: Run() caught stop signal. waiting on stop channels")
 }
 
-func (r *Reconciler) watchCRD(stopCh <-chan struct{}) {
-	terminated := false
-	for !terminated {
-		glog.Info("reconciler: creating new crd watch")
-		crdWatch := r.newCRDWatch()
-		doneCh := make(chan struct{})
-		go r.consumeCRDEvents(crdWatch.ResultChan(), doneCh)
-		select {
-		case <-stopCh:
-			glog.Info("reconciler: crd watch stop signal received")
-			terminated = true
-			crdWatch.Stop()
-			<-doneCh
-		case <-doneCh:
-			glog.Info("reconciler: crd watch done, will restart")
-		}
+func (r *Reconciler) globalBGPConfigHandler(cfg *libcalicostub.GlobalBGPConfig) error {
+	switch cfg.Name {
+	case libcalicostub.ReflectorsPerSubnetName: //add additional globalbgpconfig types to this case
+		glog.Infof("reconciler/watch: globalbgpconfig watch event for '%s' triggered resync", cfg.Name)
+		r.triggerResync()
+	default:
+		glog.Infof("reconciler/watch: globalbgpconfig watch event for '%s' ignored", cfg.Name)
 	}
-	glog.Info("reconciler: crd watch terminated")
-}
-
-func (r *Reconciler) newCRDWatch() watch.Interface {
-	glog.Info("reconciler: creating new crd watch")
-	crdResource := r.crdClient.Resource(&metav1.APIResource{
-		Name: libcalicostub.GlobalBGPConfigCRDName,
-		Kind: libcalicostub.GlobalBGPConfigResourceName,
-	}, v1.NamespaceAll)
-
-	if _, err := crdResource.Get(libcalicostub.ReflectorsPerSubnetName, metav1.GetOptions{}); err != nil {
-		if apierrors.IsNotFound(err) {
-			glog.Warningf("could not find reflectorspersubnet globalbgpconfig: %v", err)
-			glog.Warning("creating default reflectorspersubnet globalbgpconfig")
-
-			defaultRPS := libcalicostub.GlobalBGPConfig{
-				Spec: libcalicostub.GlobalBGPConfigSpec{
-					Name:  libcalicostub.ReflectorsPerSubnetProperName,
-					Value: "2",
-				},
-			}
-			defaultRPS.Name = libcalicostub.ReflectorsPerSubnetName
-			defaultRPS.Kind = libcalicostub.GlobalBGPConfigResourceName
-			defaultRPS.APIVersion = libcalicostub.GroupVersion.String()
-
-			uObj, err := unstructured.DefaultConverter.ToUnstructured(&defaultRPS)
-			if err != nil {
-				glog.Fatalf("error converting to unstructured: %v", err)
-			}
-			if _, err := crdResource.Create(&metav1unstructured.Unstructured{Object: uObj}); err != nil {
-				glog.Fatalf("error creating globalbgpconfig: %v", err)
-			}
-		} else {
-			glog.Fatalf("error getting reflectorspersubnet: %v", err)
-		}
-	}
-
-	crdWatch, err := crdResource.Watch(metav1.ListOptions{})
-	if err != nil {
-		glog.Fatalf("error creating crd watch: %v", err)
-	}
-	return crdWatch
-}
-
-func (r *Reconciler) consumeCRDEvents(evtChan <-chan watch.Event, doneCh chan<- struct{}) {
-	defer close(doneCh)
-	glog.Info("reconciler: reading crd watch event channel")
-	for evt := range evtChan {
-		if evt.Type == watch.Error {
-			glog.Fatalf("globalbgpconfig crd watch detected error: %+v", evt)
-		}
-		cfg, ok := evt.Object.(*libcalicostub.GlobalBGPConfig)
-		if !ok {
-			glog.Fatalf("could not cast event object as libcalicostub.GlobalBGPConfig: %+v", evt)
-		}
-		glog.Infof("reconciler: crd watch event received for %s/%s", cfg.Kind, cfg.Name)
-		switch cfg.Name {
-		case libcalicostub.ReflectorsPerSubnetName: //add additional globalbgpconfig types to this case
-			glog.Info("reconciler: crd watch event triggered re-sync")
-			r.triggerResync()
-		default:
-			glog.Info("reconciler: crd watch event ignored")
-		}
-	}
-	glog.Info("reconciler: crd watch event channel closed")
+	return nil
 }
 
 func (r *Reconciler) triggerResync() {
@@ -241,6 +163,7 @@ func (r *Reconciler) reconciliationLoop() {
 		resyncTimer.Reset(maxResyncPeriod)
 	}
 }
+
 func (r *Reconciler) syncSubnetReflectors() {
 	reflectorsPerSubnet, err := r.getReflectorsPerSubnet()
 	if err != nil {
@@ -291,7 +214,7 @@ func (r *Reconciler) syncSubnetReflectors() {
 			if _, ok := reflectorCounts[network]; !ok {
 				reflectorCounts[network] = 0
 			}
-			if nodeReady(node) {
+			if k8sutil.NodeReady(node) {
 				if reflectorCounts[network] < reflectorsPerSubnet {
 					// We haven't seen enough healthy reflectors for this subnet yet...
 					if reflector == "subnet" {
@@ -318,7 +241,7 @@ func (r *Reconciler) syncSubnetReflectors() {
 					actionTaken = "noop"
 				}
 			}
-			glog.Infof("[ %-21s ] node: %-30s , ready?: %-6t , action: %-15s", network, node.Name, nodeReady(node), actionTaken)
+
 			if _, err := r.clientset.CoreV1().Nodes().Update(node); err == nil {
 				switch actionTaken {
 				case "activated", "kept":
@@ -331,7 +254,12 @@ func (r *Reconciler) syncSubnetReflectors() {
 				actionLog[actionTaken]++
 				nodeCounts[network]++
 
-				glog.Infof("[ %-21s ] node %-30s updated", network, node.Name)
+				glog.Infof(`node %s:
+  ready:  %t
+  subnet: %s
+  action: %s
+`, node.Name, k8sutil.NodeReady(node), network, actionTaken)
+
 				break
 			} else {
 				if !apierrors.IsConflict(err) {
@@ -339,8 +267,8 @@ func (r *Reconciler) syncSubnetReflectors() {
 					return
 				}
 				glog.Warningf("reconciler: conflict error updating node %s: %d retries remaining", node.Name, retriesLeft)
+				time.Sleep(200 * time.Millisecond)
 			}
-			time.Sleep(500 * time.Millisecond)
 		}
 		if retriesLeft == 0 {
 			glog.Fatalf("reconciler: exhausted retries updating node %s", staleNode.Name)
@@ -373,10 +301,8 @@ Summary:
 }
 
 func (r *Reconciler) getReflectorsPerSubnet() (int, error) {
-	ures, err := r.crdClient.Resource(&metav1.APIResource{
-		Name: libcalicostub.GlobalBGPConfigCRDName,
-		Kind: libcalicostub.GlobalBGPConfigResourceName,
-	}, v1.NamespaceAll).Get(libcalicostub.ReflectorsPerSubnetName, metav1.GetOptions{})
+	ures, err := k8sutil.GlobalBGPConfigResource(r.crdClient).
+		Get(libcalicostub.ReflectorsPerSubnetName, metav1.GetOptions{})
 	if err != nil {
 		return 0, err
 	}
@@ -396,25 +322,6 @@ func (r *Reconciler) getReflectorsPerSubnet() (int, error) {
 	return cnt, nil
 }
 
-func nodeReady(node *v1.Node) bool {
-	for _, nc := range node.Status.Conditions {
-		if nc.Type == v1.NodeReady && nc.Status == v1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-func castNode(nodeI interface{}) *v1.Node {
-	node, ok := nodeI.(*v1.Node)
-	if !ok {
-		//Fail fast- this should never happen
-		glog.Fatalf("Could not cast %+v as %s", nodeI, reflect.TypeOf(node))
-		return &v1.Node{}
-	}
-	return node
-}
-
 func relevantStateChanged(oldNode, newNode *v1.Node) bool {
 	// Check relevant labels
 	for _, label := range []string{
@@ -427,35 +334,9 @@ func relevantStateChanged(oldNode, newNode *v1.Node) bool {
 	}
 
 	//check readiness
-	if nodeReady(oldNode) != nodeReady(newNode) {
+	if k8sutil.NodeReady(oldNode) != k8sutil.NodeReady(newNode) {
 		return true
 	}
 
 	return false
-}
-
-func buildCRDClientV1(cfg rest.Config) (*dynamic.Client, error) {
-
-	// Generate config using the base config.
-	cfg.GroupVersion = &libcalicostub.GroupVersion
-
-	schemeBuilder := runtime.NewSchemeBuilder(
-		func(scheme *runtime.Scheme) error {
-			scheme.AddKnownTypes(
-				*cfg.GroupVersion,
-				&libcalicostub.GlobalBGPConfig{},
-				&libcalicostub.GlobalBGPConfigList{},
-			)
-			metav1.AddToGroupVersion(scheme, *cfg.GroupVersion)
-			return nil
-		})
-	schemeBuilder.AddToScheme(scheme.Scheme)
-	cfg.APIPath = "/apis"
-	cfg.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: scheme.Codecs}
-
-	cli, err := dynamic.NewClient(&cfg)
-	if err != nil {
-		return nil, err
-	}
-	return cli, nil
 }
