@@ -200,7 +200,12 @@ func (r *Reconciler) syncSubnetReflectors() {
 		for retriesLeft = updateMaxRetry; retriesLeft > 0; retriesLeft-- {
 			node, err := r.clientset.CoreV1().Nodes().Get(staleNode.Name, metav1.GetOptions{})
 			if err != nil {
-				glog.Errorf("reconciler: error fetching node %s: %v", staleNode.Name, err)
+				if apierrors.IsNotFound(err) {
+					glog.Warningf("reconciler: node %s no longer exists... will skip", staleNode.Name, err)
+					break
+				}
+				glog.Errorf("reconciler: unexpected error fetching node %s: %v", staleNode.Name, err)
+				time.Sleep(200 * time.Millisecond)
 				continue
 			}
 
@@ -262,12 +267,19 @@ func (r *Reconciler) syncSubnetReflectors() {
 
 				break
 			} else {
-				if !apierrors.IsConflict(err) {
+				if apierrors.IsConflict(err) {
+					glog.Warningf("reconciler: conflict error updating node %s: %d retries remaining", node.Name, retriesLeft)
+					time.Sleep(200 * time.Millisecond)
+				} else if apierrors.IsNotFound(err) {
+					if actionTaken == "activated" || actionTaken == "kept" {
+						glog.Fatalf("reconciler: reflector node cannot be updated, does not exist!: %v ", err)
+					} else {
+						glog.Warningf("reconciler: non-reflector node cannot be updated, does not exist! assuming it has gone away- will skip: %v", err)
+						break
+					}
+				} else {
 					glog.Fatalf("reconciler: unexpected error updated node %s: %v", node.Name, err)
-					return
 				}
-				glog.Warningf("reconciler: conflict error updating node %s: %d retries remaining", node.Name, retriesLeft)
-				time.Sleep(200 * time.Millisecond)
 			}
 		}
 		if retriesLeft == 0 {
