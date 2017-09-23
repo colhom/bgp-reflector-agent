@@ -164,6 +164,30 @@ func (r *Reconciler) reconciliationLoop() {
 	}
 }
 
+const (
+	nodeLogFmt = "reconciler: node update -> name: %-30s ready: %-5t subnet: %-18s action: %-8s"
+	syncLogFmt = `
+Summary:
+ * kept %d reflector nodes as-is
+ * activated %d reflector nodes
+ * deactivated %d reflector nodes
+ * left %d non-reflector nodes as-is
+ -----------------------------------------
+  Node Subnet CIDR   | Nodes | Reflectors
+ -----------------------------------------
+`
+	syncRowLogFmt = "%-20s | %-5d | %-5d\n"
+)
+
+type reflectorAction string
+
+const (
+	actionNoop       reflectorAction = "noop"       // leave a non-reflector as-is
+	actionKeep       reflectorAction = "keep"       // leave a reflector as- is
+	actionActivate   reflectorAction = "activate"   // non-reflector --> reflector
+	actionDeactivate reflectorAction = "deactivate" // reflector --> non-reflector
+)
+
 func (r *Reconciler) syncSubnetReflectors() {
 	reflectorsPerSubnet, err := r.getReflectorsPerSubnet()
 	if err != nil {
@@ -184,103 +208,87 @@ func (r *Reconciler) syncSubnetReflectors() {
 		glog.Fatalf("error listing non-reflector nodes: %v", err)
 	}
 	glog.Infof("found %d reflector nodes and %d non-reflector nodes", len(reflectorNodes), len(nonReflectorNodes))
+	actionLog := make(map[reflectorAction]int)
 
-	actionLog := map[string]int{
-		"noop":        0,
-		"kept":        0,
-		"activated":   0,
-		"deactivated": 0,
+	//returns (actionTaken,err)
+	transitionSubnetReflectorState := func(node *v1.Node) (reflectorAction, error) {
+		network := node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel]
+		reflector := node.Labels[libcalicostub.NodeBgpReflectorLabel]
+
+		if k8sutil.NodeReady(node) && reflectorCounts[network] < reflectorsPerSubnet {
+			// Should be a reflector
+			switch reflector {
+			case "subnet":
+				return actionKeep, nil
+			case "":
+				node.Labels[libcalicostub.NodeBgpReflectorLabel] = "subnet"
+				return actionActivate, nil
+			}
+		}
+		// Shouldn't be a reflector
+		switch reflector {
+		case "subnet":
+			delete(node.Labels, libcalicostub.NodeBgpReflectorLabel)
+			return actionDeactivate, nil
+		case "":
+			return actionNoop, nil
+		}
+
+		return "", fmt.Errorf("node %s: unsupported label value for %s= %s",
+			node.Name, libcalicostub.NodeBgpReflectorLabel, node.Labels[libcalicostub.NodeBgpReflectorLabel])
 	}
 
 	//It's important to always process existing reflector nodes first before any non-reflector nodes
 	//so we have the opportunity to acknowledge their existence before appointing new ones to meet quota
 	for _, staleNode := range append(reflectorNodes, nonReflectorNodes...) {
-		var retriesLeft int
-		var actionTaken string
-		for retriesLeft = updateMaxRetry; retriesLeft > 0; retriesLeft-- {
-			node, err := r.clientset.CoreV1().Nodes().Get(staleNode.Name, metav1.GetOptions{})
+		retriesLeft := updateMaxRetry
+		for ; retriesLeft > 0; retriesLeft-- {
+			node, err := r.nodeInformer.Lister().Get(staleNode.Name)
 			if err != nil {
 				if apierrors.IsNotFound(err) {
 					glog.Warningf("reconciler: node %s no longer exists... will skip", staleNode.Name, err)
 					break
 				}
 				glog.Errorf("reconciler: unexpected error fetching node %s: %v", staleNode.Name, err)
-				time.Sleep(200 * time.Millisecond)
 				continue
 			}
-
 			network, ok := node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel]
 			if !ok {
-				glog.Warningf("node %s is missing %s label! Will skip this node....", node.Name, libcalicostub.NodeBgpIpv4NetworkLabel)
+				glog.Errorf("reconciler: node %s is missing label %s- will skip", node.Name, libcalicostub.NodeBgpIpv4NetworkLabel)
 				break
 			}
 
-			reflector := node.Labels[libcalicostub.NodeBgpReflectorLabel]
-			if _, ok := reflectorCounts[network]; !ok {
-				reflectorCounts[network] = 0
-			}
-			if k8sutil.NodeReady(node) {
-				if reflectorCounts[network] < reflectorsPerSubnet {
-					// We haven't seen enough healthy reflectors for this subnet yet...
-					if reflector == "subnet" {
-						actionTaken = "kept"
-					} else {
-						node.Labels[libcalicostub.NodeBgpReflectorLabel] = "subnet"
-						actionTaken = "activated"
-					}
-				} else {
-					// We have already seen desired number of reflectors for this subnet
-					if reflector == "subnet" {
-						delete(node.Labels, libcalicostub.NodeBgpReflectorLabel)
-						actionTaken = "deactivated"
-					} else {
-						actionTaken = "noop"
-					}
-				}
-			} else {
-				// Node not healthy --> make sure we're not already relying on it to be a reflector
-				if reflector == "subnet" {
-					delete(node.Labels, libcalicostub.NodeBgpReflectorLabel)
-					actionTaken = "deactivated"
-				} else {
-					actionTaken = "noop"
-				}
-			}
-
-			if _, err := r.clientset.CoreV1().Nodes().Update(node); err == nil {
-				switch actionTaken {
-				case "activated", "kept":
-					reflectorCounts[network]++
-				case "noop", "deactivated":
-					//Lack of increment expresses this
-				default:
-					glog.Fatalf("reconciler: invalid action '%s' taken! this should never happen", actionTaken)
-				}
-				actionLog[actionTaken]++
-				nodeCounts[network]++
-
-				glog.Infof(`node %s:
-  ready:  %t
-  subnet: %s
-  action: %s
-`, node.Name, k8sutil.NodeReady(node), network, actionTaken)
-
+			actionTaken, err := transitionSubnetReflectorState(node)
+			if err != nil {
+				glog.Errorf("reconciler: %v -will skip", err)
 				break
-			} else {
-				if apierrors.IsConflict(err) {
-					glog.Warningf("reconciler: conflict error updating node %s: %d retries remaining", node.Name, retriesLeft)
-					time.Sleep(200 * time.Millisecond)
-				} else if apierrors.IsNotFound(err) {
-					if actionTaken == "activated" || actionTaken == "kept" {
-						glog.Fatalf("reconciler: reflector node cannot be updated, does not exist!: %v ", err)
-					} else {
-						glog.Warningf("reconciler: non-reflector node cannot be updated, does not exist! assuming it has gone away- will skip: %v", err)
+			}
+			if actionTaken == actionActivate || actionTaken == actionDeactivate {
+				// Need to update API
+				if _, err := r.clientset.CoreV1().Nodes().Update(node); err != nil {
+					if apierrors.IsConflict(err) {
+						glog.Warningf("reconciler: node %s cannot be updated, conflict error: %v", node.Name, err)
+						continue
+					}
+					if apierrors.IsNotFound(err) {
+						glog.Warningf("reconciler: node %s cannot be updated, cannot not be found: %v", node.Name, err)
+						if actionTaken == actionActivate {
+							continue
+						}
 						break
 					}
-				} else {
-					glog.Fatalf("reconciler: unexpected error updated node %s: %v", node.Name, err)
+					glog.Fatalf("reconciler: unexpected error updating node %s: %v", node.Name, err)
 				}
+				glog.Infof(nodeLogFmt, node.Name, k8sutil.NodeReady(node), network, actionTaken)
 			}
+
+			if actionTaken == actionActivate || actionTaken == actionKeep {
+				// Is this node a reflector?
+				reflectorCounts[network]++
+			}
+			actionLog[actionTaken]++
+			nodeCounts[network]++
+			break
 		}
 		if retriesLeft == 0 {
 			glog.Fatalf("reconciler: exhausted retries updating node %s", staleNode.Name)
@@ -290,25 +298,10 @@ func (r *Reconciler) syncSubnetReflectors() {
 
 	glog.Info("Reconcilation loop done!")
 	tbl := bytes.Buffer{}
-	tbl.WriteString(fmt.Sprintf(`
-Summary:
- * kept %d reflector nodes as-is
- * activated %d reflector nodes
- * deactivated %d reflector nodes
- * left %d non-reflector nodes as-is
- -----------------------------------------
-  Node Subnet CIDR   | Nodes | Reflectors
- -----------------------------------------
-`, actionLog["kept"], actionLog["activated"], actionLog["deactivated"], actionLog["noop"]))
-
+	tbl.WriteString(fmt.Sprintf(syncLogFmt, actionLog[actionKeep], actionLog[actionActivate], actionLog[actionDeactivate], actionLog[actionNoop]))
 	for network := range nodeCounts {
-		tbl.WriteString(fmt.Sprintf(
-			"%-20s | %-5d | %-5d\n",
-			network, nodeCounts[network], reflectorCounts[network]))
+		tbl.WriteString(fmt.Sprintf(syncRowLogFmt, network, nodeCounts[network], reflectorCounts[network]))
 	}
-	tbl.WriteString(`
- ----------------------------------------
-`)
 	glog.Info(tbl.String())
 }
 
