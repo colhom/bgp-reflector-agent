@@ -3,13 +3,46 @@ package k8sutil
 import (
 	"fmt"
 
+	"github.com/coreos/bgp-reflector-agent/pkg/libcalicostub"
 	"github.com/golang/glog"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 )
 
 type CRDHandler func(watch.Event) error
+
+func init() {
+	schemeBuilder := runtime.NewSchemeBuilder(
+		func(scheme *runtime.Scheme) error {
+			scheme.AddKnownTypes(
+				libcalicostub.GroupVersion,
+				&libcalicostub.GlobalBGPConfig{},
+				&libcalicostub.GlobalBGPConfigList{},
+			)
+			metav1.AddToGroupVersion(scheme, libcalicostub.GroupVersion)
+			return nil
+		})
+	schemeBuilder.AddToScheme(scheme.Scheme)
+}
+
+func BuildCRDClientV1(cfg *rest.Config) (*dynamic.Client, error) {
+
+	// Generate config using the base config.
+	cfg.GroupVersion = &libcalicostub.GroupVersion
+	cfg.APIPath = "/apis"
+	cfg.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: scheme.Codecs}
+
+	cli, err := dynamic.NewClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return cli, nil
+}
 
 func WatchCRDResources(crdResource dynamic.ResourceInterface, handler CRDHandler, stopCh <-chan struct{}) error {
 	for {
