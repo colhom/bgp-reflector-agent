@@ -15,8 +15,9 @@ const (
 	NodeBgpReflectorLabel   = "projectcalico.org/reflector"
 	NodeBgpIpv4NetworkLabel = "projectcalico.org/ipv4-network"
 
-	GlobalBGPConfigResourceName = "GlobalBGPConfig"
-	GlobalBGPConfigCRDName      = "globalbgpconfigs"
+	GlobalBGPConfigResourceName     = "GlobalBGPConfig"
+	GlobalBGPConfigListResourceName = "GlobalBGPConfigList"
+	GlobalBGPConfigCRDName          = "globalbgpconfigs"
 
 	ReflectorsPerSubnetName       = "reflectorspersubnet"
 	ReflectorsPerSubnetProperName = "ReflectorsPerSubnet"

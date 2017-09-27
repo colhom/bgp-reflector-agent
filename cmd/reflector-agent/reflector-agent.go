@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/coreos/bgp-reflector-agent/pkg/k8sutil"
 	"github.com/coreos/bgp-reflector-agent/pkg/nodereconciler"
 	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
@@ -35,6 +36,11 @@ func main() {
 	if err != nil {
 		glog.Fatalf("error creating clientset: %v", err)
 	}
+	crdClient, err := k8sutil.BuildCRDClientV1(config)
+	if err != nil {
+		glog.Fatalf("error building crd dynamic client: %v", err)
+	}
+
 	nodeName := os.Getenv("NODENAME")
 	if nodeName == "" {
 		glog.Fatalf("NODENAME environment variable required")
@@ -79,7 +85,10 @@ func main() {
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(stopCh <-chan struct{}) {
 				glog.Info("leaderelect: now leading!")
-				reconciler := nodereconciler.NewReconciler(clientset, config)
+				reconciler, err := nodereconciler.NewReconciler(clientset, crdClient)
+				if err != nil {
+					glog.Fatalf("error creating reconciler: %v", err)
+				}
 				reconciler.Run(stopCh)
 				glog.Info("reconciler: run loop terminated! should no longer be leader")
 			},
