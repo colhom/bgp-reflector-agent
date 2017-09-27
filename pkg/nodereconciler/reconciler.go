@@ -15,18 +15,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
+	"sort"
+
 	"k8s.io/apimachinery/pkg/conversion/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	informersv1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
 
 const (
-	// Maximum amount of time between reconiliation passes
-	maxResyncPeriod = 3 * time.Minute
+	// Maximum amount of time between reconiliation passes. 0 disables resync logic
+	maxResyncPeriod = 5 * time.Minute
 
 	// Number of times we retry updating a node
 	updateMaxRetry = 10
@@ -53,30 +54,36 @@ func init() {
 
 //TODO: expose reconciler state/metrics (last run, errors, etc) via health check and/or prom metrics endpoint
 type Reconciler struct {
-	clientset    *kubernetes.Clientset
-	config       *rest.Config
-	crdClient    *dynamic.Client
+	clientset    kubernetes.Interface
+	crdClient    dynamic.Interface
 	nodeInformer informersv1.NodeInformer
 	triggerQueue chan *time.Time
 }
 
 func NewReconciler(
-	clientset *kubernetes.Clientset,
-	config *rest.Config,
+	clientset kubernetes.Interface,
+	crdClient dynamic.Interface,
 ) *Reconciler {
 
 	informerFactory := informers.NewSharedInformerFactory(clientset, maxResyncPeriod)
 
 	nodeInformer := informerFactory.Core().V1().Nodes()
 
-	crdClient, err := k8sutil.BuildCRDClientV1(*config)
-	if err != nil {
-		glog.Fatalf("error building crd dynamic client: %v", err)
+	// create default reflectorspersubnet globalbgpconfig if it does not exist
+	crdResource := k8sutil.GlobalBGPConfigResource(crdClient)
+	if _, err := crdResource.Get(libcalicostub.ReflectorsPerSubnetName, metav1.GetOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			glog.Warningf("reconciler: could not find reflectorspersubnet globalbgpconfig: %v", err)
+			if err := k8sutil.CreateReflectorsPerSubnetConfig(crdResource, 2); err != nil {
+				glog.Fatalf("reconciler: error creating globalconfig %v", err)
+			}
+		} else {
+			glog.Fatalf("reconciler: error reading globalbgpconfig: %v", err)
+		}
 	}
 
 	reconciler := &Reconciler{
 		clientset:    clientset,
-		config:       config,
 		crdClient:    crdClient,
 		nodeInformer: nodeInformer,
 		triggerQueue: make(chan *time.Time, triggerWindow),
@@ -173,10 +180,10 @@ Summary:
  * deactivated %d reflector nodes
  * left %d non-reflector nodes as-is
  -----------------------------------------
-  Node Subnet CIDR   | Nodes | Reflectors
+  Node Subnet CIDR   | Ready Nodes | Unready Nodes | Reflectors
  -----------------------------------------
 `
-	syncRowLogFmt = "%-20s | %-5d | %-5d\n"
+	syncRowLogFmt = "%-20s |    %-5d    |     %-5d     | %-5d\n"
 )
 
 type reflectorAction string
@@ -188,6 +195,11 @@ const (
 	actionDeactivate reflectorAction = "deactivate" // reflector --> non-reflector
 )
 
+type nodeCount struct {
+	Ready   int
+	Unready int
+}
+
 func (r *Reconciler) syncSubnetReflectors() {
 	reflectorsPerSubnet, err := r.getReflectorsPerSubnet()
 	if err != nil {
@@ -196,7 +208,7 @@ func (r *Reconciler) syncSubnetReflectors() {
 	glog.Infof("starting reconciliation pass: configuring %d reflectors per subnet", reflectorsPerSubnet)
 
 	reflectorCounts := map[string]int{}
-	nodeCounts := map[string]int{}
+	nodeCounts := map[string]*nodeCount{}
 
 	reflectorNodes, err := r.nodeInformer.Lister().List(reflectorSelector)
 	if err != nil {
@@ -254,8 +266,11 @@ func (r *Reconciler) syncSubnetReflectors() {
 			}
 			network, ok := node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel]
 			if !ok {
-				glog.Errorf("reconciler: node %s is missing label %s- will skip", node.Name, libcalicostub.NodeBgpIpv4NetworkLabel)
+				glog.Warningf("reconciler: node %s is missing label %s- will skip", node.Name, libcalicostub.NodeBgpIpv4NetworkLabel)
 				break
+			}
+			if nodeCounts[network] == nil {
+				nodeCounts[network] = &nodeCount{}
 			}
 
 			actionTaken, err := transitionSubnetReflectorState(node)
@@ -287,7 +302,11 @@ func (r *Reconciler) syncSubnetReflectors() {
 				reflectorCounts[network]++
 			}
 			actionLog[actionTaken]++
-			nodeCounts[network]++
+			if k8sutil.NodeReady(node) {
+				nodeCounts[network].Ready++
+			} else {
+				nodeCounts[network].Unready++
+			}
 			break
 		}
 		if retriesLeft == 0 {
@@ -296,11 +315,18 @@ func (r *Reconciler) syncSubnetReflectors() {
 		}
 	}
 
+	// sort network keys
+	networks := []string{}
+	for network := range nodeCounts {
+		networks = append(networks, network)
+	}
+	sort.Strings(networks)
+
 	glog.Info("Reconcilation loop done!")
 	tbl := bytes.Buffer{}
 	tbl.WriteString(fmt.Sprintf(syncLogFmt, actionLog[actionKeep], actionLog[actionActivate], actionLog[actionDeactivate], actionLog[actionNoop]))
-	for network := range nodeCounts {
-		tbl.WriteString(fmt.Sprintf(syncRowLogFmt, network, nodeCounts[network], reflectorCounts[network]))
+	for _, network := range networks {
+		tbl.WriteString(fmt.Sprintf(syncRowLogFmt, network, nodeCounts[network].Ready, nodeCounts[network].Unready, reflectorCounts[network]))
 	}
 	glog.Info(tbl.String())
 }

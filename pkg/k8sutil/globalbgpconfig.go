@@ -6,7 +6,6 @@ import (
 	"github.com/coreos/bgp-reflector-agent/pkg/libcalicostub"
 	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	metav1unstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/conversion/unstructured"
@@ -16,12 +15,8 @@ import (
 
 type GlobalBGPConfigHandler func(*libcalicostub.GlobalBGPConfig) error
 
-func WatchGlobalBGPConfigs(crdClient *dynamic.Client, handler GlobalBGPConfigHandler, stopCh <-chan struct{}) error {
+func WatchGlobalBGPConfigs(crdClient dynamic.Interface, handler GlobalBGPConfigHandler, stopCh <-chan struct{}) error {
 	crdResource := GlobalBGPConfigResource(crdClient)
-	if err := ensureReflectorsPerSubnetConfig(crdResource); err != nil {
-		return err
-	}
-
 	castHandler := func(evt watch.Event) error {
 		cfg, ok := evt.Object.(*libcalicostub.GlobalBGPConfig)
 		if !ok {
@@ -33,40 +28,35 @@ func WatchGlobalBGPConfigs(crdClient *dynamic.Client, handler GlobalBGPConfigHan
 	return WatchCRDResources(crdResource, castHandler, stopCh)
 }
 
-func GlobalBGPConfigResource(crdClient *dynamic.Client) dynamic.ResourceInterface {
+func GlobalBGPConfigResource(crdClient dynamic.Interface) dynamic.ResourceInterface {
 	return crdClient.Resource(&metav1.APIResource{
 		Name: libcalicostub.GlobalBGPConfigCRDName,
 		Kind: libcalicostub.GlobalBGPConfigResourceName,
 	}, v1.NamespaceAll)
 }
 
-func ensureReflectorsPerSubnetConfig(crdResource dynamic.ResourceInterface) error {
-	// create default reflectorspersubnet globalbgpconfig if it does not exist
-	if _, err := crdResource.Get(libcalicostub.ReflectorsPerSubnetName, metav1.GetOptions{}); err != nil {
-		if apierrors.IsNotFound(err) {
-			glog.Warningf("could not find reflectorspersubnet globalbgpconfig: %v", err)
-			glog.Warning("creating default reflectorspersubnet globalbgpconfig")
+func CreateReflectorsPerSubnetConfig(crdResource dynamic.ResourceInterface, reflectorsPerSubnet int) error {
+	if reflectorsPerSubnet < 1 {
+		return fmt.Errorf("reflectorsPerSubnet must be >= 1")
+	}
 
-			defaultRPS := libcalicostub.GlobalBGPConfig{
-				Spec: libcalicostub.GlobalBGPConfigSpec{
-					Name:  libcalicostub.ReflectorsPerSubnetProperName,
-					Value: "2",
-				},
-			}
-			defaultRPS.Name = libcalicostub.ReflectorsPerSubnetName
-			defaultRPS.Kind = libcalicostub.GlobalBGPConfigResourceName
-			defaultRPS.APIVersion = libcalicostub.GroupVersion.String()
+	glog.Infof("creating reflectorspersubnet=%d globalbgpconfig", reflectorsPerSubnet)
+	defaultRPS := libcalicostub.GlobalBGPConfig{
+		Spec: libcalicostub.GlobalBGPConfigSpec{
+			Name:  libcalicostub.ReflectorsPerSubnetProperName,
+			Value: fmt.Sprintf("%d", reflectorsPerSubnet),
+		},
+	}
+	defaultRPS.Name = libcalicostub.ReflectorsPerSubnetName
+	defaultRPS.Kind = libcalicostub.GlobalBGPConfigResourceName
+	defaultRPS.APIVersion = libcalicostub.GroupVersion.String()
 
-			uObj, err := unstructured.DefaultConverter.ToUnstructured(&defaultRPS)
-			if err != nil {
-				return fmt.Errorf("error converting to unstructured: %v", err)
-			}
-			if _, err := crdResource.Create(&metav1unstructured.Unstructured{Object: uObj}); err != nil {
-				return fmt.Errorf("error creating globalbgpconfig: %v", err)
-			}
-		} else {
-			return fmt.Errorf("error getting reflectorspersubnet: %v", err)
-		}
+	uObj, err := unstructured.DefaultConverter.ToUnstructured(&defaultRPS)
+	if err != nil {
+		return fmt.Errorf("error converting globalbgpconfig to unstructured: %v", err)
+	}
+	if _, err := crdResource.Create(&metav1unstructured.Unstructured{Object: uObj}); err != nil {
+		return fmt.Errorf("error creating globalbgpconfig: %v", err)
 	}
 
 	return nil
