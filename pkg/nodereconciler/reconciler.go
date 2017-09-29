@@ -258,7 +258,7 @@ func (r *Reconciler) syncSubnetReflectors() {
 			node, err := r.nodeInformer.Lister().Get(staleNode.Name)
 			if err != nil {
 				if apierrors.IsNotFound(err) {
-					glog.Warningf("reconciler: node %s no longer exists... will skip", staleNode.Name, err)
+					glog.Warningf("reconciler: node %s no longer exists... will skip", staleNode.Name)
 					break
 				}
 				glog.Errorf("reconciler: unexpected error fetching node %s: %v", staleNode.Name, err)
