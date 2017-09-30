@@ -38,10 +38,9 @@ const (
 	defaultSubnetCnt           = 8
 
 	defaultLogDir = "./reconciler-test-logs"
-	// How many consecutive failed reflector state checks before reporting Error
-	maxFailedReflectorChecks = 3
-	// How often to run reflector check
-	reflectorCheckInterval = 500 * time.Millisecond
+
+	// max time a single reconciler sync run is allowed to take
+	maxReconcileDuration = 500 * time.Millisecond
 )
 
 var (
@@ -87,7 +86,7 @@ func init() {
 	parsePositiveInt("NODE_COUNT", &nodeCnt, defaultNodeCnt)
 	parsePositiveInt("ACTION_COUNT", &actionCnt, defaultActionCnt)
 	parsePositiveInt("SUBNET_COUNT", &subnetCnt, defaultSubnetCnt)
-	parsePositiveInt("REFLECTORS_PER_SUBNET", &reflectorsPerSubnet, defaultSubnetCnt)
+	parsePositiveInt("REFLECTORS_PER_SUBNET", &reflectorsPerSubnet, defaultReflectorsPerSubnet)
 
 	if nodeCnt < subnetCnt {
 		glog.Fatalf("invalid arguments: nodeCount (%d) must be >= subnetCount (%d)",
@@ -99,18 +98,20 @@ func init() {
 	}
 }
 
-type kClientset struct {
+type coreTestClientset struct {
 	*fake.Clientset
 }
-type extClientset struct {
+type extTestClientset struct {
 	*extfake.Clientset
 }
-type Clientset struct {
-	kClientset
-	extClientset
+
+//TODO: move this to test-utils package and export
+type testClientset struct {
+	coreTestClientset
+	extTestClientset
 }
 
-func (c *Clientset) Discovery() discovery.DiscoveryInterface {
+func (c *testClientset) Discovery() discovery.DiscoveryInterface {
 	return nil
 }
 
@@ -119,15 +120,12 @@ func TestIntegrationFull(t *testing.T) {
 		t.Skipf("skipping full integration test")
 	}
 	client := newClientset(t)
-	r := newReconciler(t, client)
+	r, reportChan := newReconciler(t, client)
 
 	reconcilerStopCh := make(chan struct{})
 	defer close(reconcilerStopCh)
 	go r.Run(reconcilerStopCh)
-
-	reflectorCheckStopCh := make(chan struct{})
-	defer close(reflectorCheckStopCh)
-	go runReflectorCheck(t, client, reflectorsPerSubnet, reflectorCheckStopCh)
+	go runReflectorCheck(t, client, reportChan)
 
 	wg := &sync.WaitGroup{}
 	for nodeNumber := 0; nodeNumber < nodeCnt; nodeNumber++ {
@@ -144,15 +142,12 @@ func TestIntegrationFull(t *testing.T) {
 
 func TestScaleUpDown(t *testing.T) {
 	client := newClientset(t)
-	r := newReconciler(t, client)
+	r, reportChan := newReconciler(t, client)
 
 	reconcilerStopCh := make(chan struct{})
 	defer close(reconcilerStopCh)
 	go r.Run(reconcilerStopCh)
-
-	reflectorCheckStopCh := make(chan struct{})
-	defer close(reflectorCheckStopCh)
-	go runReflectorCheck(t, client, reflectorsPerSubnet, reflectorCheckStopCh)
+	go runReflectorCheck(t, client, reportChan)
 
 	wg := &sync.WaitGroup{}
 	for nodeNumber := 0; nodeNumber < nodeCnt; nodeNumber++ {
@@ -167,7 +162,7 @@ func TestScaleUpDown(t *testing.T) {
 	time.Sleep(3 * time.Second)
 }
 
-func newClientset(t *testing.T) *Clientset {
+func newClientset(t *testing.T) *testClientset {
 	ot := ctesting.NewObjectTracker(scheme.Scheme, scheme.Codecs.UniversalDecoder())
 	fakePtr := ctesting.Fake{}
 	fakeWatch := watch.NewRaceFreeFake()
@@ -191,20 +186,20 @@ func newClientset(t *testing.T) *Clientset {
 		return false, nil, nil
 	})
 
-	return &Clientset{
-		kClientset{&fake.Clientset{Fake: fakePtr}},
-		extClientset{&extfake.Clientset{Fake: fakePtr}},
+	return &testClientset{
+		coreTestClientset{&fake.Clientset{Fake: fakePtr}},
+		extTestClientset{&extfake.Clientset{Fake: fakePtr}},
 	}
 }
 
-func newTestNode(name string) *v1.Node {
+func newTestNode(name string) v1.Node {
 	node := v1.Node{}
 	node.Name = name
 	node.CreationTimestamp = metav1.Now()
 	node.Labels = make(map[string]string)
 	node.Annotations = make(map[string]string)
 	node.Status.Conditions = []v1.NodeCondition{}
-	return &node
+	return node
 }
 
 func parsePositiveInt(envVar string, val *int, defaultVal int) {
@@ -224,15 +219,21 @@ func parsePositiveInt(envVar string, val *int, defaultVal int) {
 	}
 }
 
-func newReconciler(t *testing.T, client *Clientset) *Reconciler {
-	crdClient := &dfake.FakeClient{libcalicostub.GroupVersion, &client.kClientset.Fake}
-	if _, err := client.extClientset.ApiextensionsV1beta1().CustomResourceDefinitions().Create(gbcCrd); err != nil {
+func newReconciler(t *testing.T, client *testClientset) (*Reconciler, <-chan reconcileReport) {
+	crdClient := &dfake.FakeClient{libcalicostub.GroupVersion, &client.coreTestClientset.Fake}
+	if _, err := client.ApiextensionsV1beta1().CustomResourceDefinitions().Create(gbcCrd); err != nil {
 		t.Fatalf("error creating crd: %v", err)
 	}
 	if err := k8sutil.CreateReflectorsPerSubnetConfig(k8sutil.GlobalBGPConfigResource(crdClient), reflectorsPerSubnet); err != nil {
 		t.Fatalf("could not create default globalbgpconfig: %v", err)
 	}
-	return NewReconciler(client, crdClient)
+	r, err := NewReconciler(client, crdClient)
+	if err != nil {
+		t.Fatalf("could not create reconciler: %v", err)
+	}
+	reportChan := make(chan reconcileReport)
+	r.reportChan = reportChan
+	return r, reportChan
 }
 
 func listNodes(t *testing.T, client kubernetes.Interface) []v1.Node {
@@ -244,27 +245,35 @@ func listNodes(t *testing.T, client kubernetes.Interface) []v1.Node {
 
 }
 
-func getNode(t *testing.T, client kubernetes.Interface, name string) *v1.Node {
+func getNode(t *testing.T, client kubernetes.Interface, name string) v1.Node {
 	node, err := client.CoreV1().Nodes().Get(name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("error creating node: %v", err)
 	}
-	return node
+	return *k8sutil.MustCastNode(node.DeepCopyObject())
 }
 
-func addNode(t *testing.T, client kubernetes.Interface, node *v1.Node) {
-	if _, err := client.CoreV1().Nodes().Create(node); err != nil {
+var writeLock = &sync.RWMutex{}
+
+func addNode(t *testing.T, client kubernetes.Interface, node v1.Node) {
+	writeLock.RLock()
+	defer writeLock.RUnlock()
+	if _, err := client.CoreV1().Nodes().Create(&node); err != nil {
 		t.Fatalf("error creating node: %v", err)
 	}
 }
 
-func updateNode(t *testing.T, client kubernetes.Interface, node *v1.Node) {
-	if _, err := client.CoreV1().Nodes().Update(node); err != nil {
+func updateNode(t *testing.T, client kubernetes.Interface, node v1.Node) {
+	writeLock.RLock()
+	defer writeLock.RUnlock()
+	if _, err := client.CoreV1().Nodes().Update(&node); err != nil {
 		t.Fatalf("error updating node: %v", err)
 	}
 }
 
 func deleteNode(t *testing.T, client kubernetes.Interface, name string) {
+	writeLock.RLock()
+	defer writeLock.RUnlock()
 	if err := client.CoreV1().Nodes().Delete(name, nil); err != nil {
 		t.Fatalf("error deleting node: %v", err)
 	}
@@ -292,37 +301,46 @@ func nodeSetReady(node *v1.Node, ready bool) {
 	})
 }
 
-func checkSubnetReflectors(t *testing.T, client kubernetes.Interface, network string, reflectorsPerSubnet int) error {
-	subnetSel := fmt.Sprintf("%s=%s", libcalicostub.NodeBgpIpv4NetworkLabel, network)
-
-	subnetNodes, err := client.CoreV1().Nodes().List(metav1.ListOptions{LabelSelector: subnetSel})
-	if err != nil {
-		t.Fatalf("error listing subnet nodes : %v", err)
-	}
-
-	reflectorCnt := 0
-	healthyCnt := 0
-	for _, node := range subnetNodes.Items {
-		if node.Labels[libcalicostub.NodeBgpReflectorLabel] == "subnet" {
-			reflectorCnt++
+func checkSubnetReflectors(nodes []v1.Node, reflectorsPerSubnet int) (errors []error) {
+	nodeCounts := make(nodeReport)
+	errors = []error{}
+	for _, node := range nodes {
+		network, err := k8sutil.NodeNetworkValue(&node)
+		if err != nil {
+			continue
+		}
+		if nodeCounts[network] == nil {
+			nodeCounts[network] = &nodeCount{}
 		}
 
-		if k8sutil.NodeReady(&node) && node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel] != "" {
-			healthyCnt++
+		reflector, _ := k8sutil.NodeReflectorValue(&node)
+		if reflector == "subnet" {
+			nodeCounts[network].reflector++
+		}
+
+		if k8sutil.NodeReady(&node) {
+			nodeCounts[network].ready++
+		} else {
+			nodeCounts[network].unready++
+			if reflector != "" {
+				errors = append(errors, fmt.Errorf("reflector check failed: node %s status is not ready but node is enabled as reflector", node.Name))
+			}
 		}
 	}
 
-	var expectedReflectorCnt int
-	if healthyCnt >= reflectorsPerSubnet {
-		expectedReflectorCnt = reflectorsPerSubnet
-	} else {
-		expectedReflectorCnt = healthyCnt
+	for network, count := range nodeCounts {
+		var expectedReflectorCnt int
+		if count.ready >= reflectorsPerSubnet {
+			expectedReflectorCnt = reflectorsPerSubnet
+		} else {
+			expectedReflectorCnt = count.ready
+		}
+		if count.reflector != expectedReflectorCnt {
+			errors = append(errors, fmt.Errorf("network %s: expected reflector count mismatch, expected=%d , observed=%d", network, expectedReflectorCnt, count.reflector))
+		}
 	}
 
-	if reflectorCnt != expectedReflectorCnt {
-		return fmt.Errorf("network %s: expected reflector count mismatch, expected=%d , observed=%d", network, expectedReflectorCnt, reflectorCnt)
-	}
-	return nil
+	return
 }
 
 // Run through node lifecycle exactly once, then exit
@@ -338,7 +356,7 @@ func simulateNodeLifecycle(t *testing.T, client kubernetes.Interface, nodeName, 
 	updateNode(t, client, node)
 
 	randSleep(2, 3, time.Second)
-	nodeSetReady(node, true)
+	nodeSetReady(&node, true)
 	updateNode(t, client, node)
 
 	// Node is healthy, wait here for awhile
@@ -346,7 +364,7 @@ func simulateNodeLifecycle(t *testing.T, client kubernetes.Interface, nodeName, 
 
 	if rand.Intn(2) > 0 {
 		// probabalistically set node to NotReady before deletion
-		nodeSetReady(node, false)
+		nodeSetReady(&node, false)
 		updateNode(t, client, node)
 		randSleep(2, 3, time.Second)
 	}
@@ -360,7 +378,7 @@ func simulateNodeEvents(t *testing.T, client kubernetes.Interface, nodeName, nod
 	exists := false
 	createNode := func() {
 		node := newTestNode(nodeName)
-		nodeSetReady(node, false)
+		nodeSetReady(&node, false)
 		node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel] = nodeNetwork
 		addNode(t, client, node)
 		exists = true
@@ -369,12 +387,12 @@ func simulateNodeEvents(t *testing.T, client kubernetes.Interface, nodeName, nod
 	actions := []func(){
 		func() {
 			node := getNode(t, client, nodeName)
-			nodeSetReady(node, true)
+			nodeSetReady(&node, true)
 			updateNode(t, client, node)
 		},
 		func() {
 			node := getNode(t, client, nodeName)
-			nodeSetReady(node, false)
+			nodeSetReady(&node, false)
 			updateNode(t, client, node)
 		},
 		func() {
@@ -392,64 +410,60 @@ func simulateNodeEvents(t *testing.T, client kubernetes.Interface, nodeName, nod
 	}
 }
 
-func runReflectorCheck(t *testing.T, client kubernetes.Interface, reflectorsPerSubnet int, stopCh <-chan struct{}) {
-	networkErrCnt := map[string]int{}
-	nodeErrCnt := map[string]int{}
+func runReflectorCheck(t *testing.T, client kubernetes.Interface, reportChan <-chan reconcileReport) {
 	t.Logf("reflector check has started")
 	defer t.Logf("reflector check has exited!")
 
-	runCnt := 0
-	start := time.Now()
+	// How long we'll tolerate no reports happening
+	zombieTimer := time.NewTimer(maxResyncPeriod)
 	for {
+		zombieTimer.Reset(maxResyncPeriod)
+		reconcileNeeded := true
+
 		select {
-		case <-stopCh:
-			t.Logf("reflector check: %d runs in last %s", runCnt, time.Since(start).String())
-			t.Logf("reflector check: caught stop signal")
-			return
-		case <-time.After(reflectorCheckInterval * 20):
-			t.Logf("reflector check: %d runs in last %s", runCnt, time.Since(start).String())
-		case <-time.After(reflectorCheckInterval):
-			runCnt++
-			nodes := listNodes(t, client)
-			networks := map[string]bool{}
-			for _, node := range nodes {
-				network, ok := node.Labels[libcalicostub.NodeBgpIpv4NetworkLabel]
-				if ok {
-					networks[network] = true
+		case <-zombieTimer.C:
+			t.Fatalf("reflector check: zombie timer expired, no reconcile events for last %s", maxResyncPeriod.String())
+		case report := <-reportChan:
+			if report.reflectorsPerSubnet == 0 {
+				t.Logf("reflector check: report channel closed, will exit")
+				return
+			} else if report.end.IsZero() && report.start.IsZero() {
+				// this means a reconcile pass is requesting to start
+				// stop all test generated write events until it's done and we've grabbed the node list
+				writeLock.Lock()
+
+				nodes := listNodes(t, client)
+				if len(checkSubnetReflectors(nodes, report.reflectorsPerSubnet)) == 0 {
+					// We can expect reconciler to not change anything on this run
+					reconcileNeeded = false
 				}
 
-				if _, ok := node.Labels[libcalicostub.NodeBgpReflectorLabel]; ok && !k8sutil.NodeReady(&node) {
-					nodeErrCnt[node.Name]++
-					t.Logf("node %s: reflector check failed %d/%d times in a row: Node is not ready but enabled as reflector",
-						node.Name, nodeErrCnt[node.Name], maxFailedReflectorChecks)
-				} else {
-					if nodeErrCnt[node.Name] > 0 {
-						t.Logf("node %s: reflector check success after %d consecutive failures, will reset fail counter", node.Name, nodeErrCnt[node.Name])
-						nodeErrCnt[node.Name] = 0
+			} else if !report.start.IsZero() && !report.end.IsZero() {
+				// As this is testing code, we can trust the reconciler to always end with this case
+				// before the channel is closed and loop exits
+
+				// Grab view of nodes to audit
+				nodes := listNodes(t, client)
+				writeLock.Unlock()
+
+				runDur := report.end.Sub(report.start)
+				if runDur > maxReconcileDuration {
+					t.Logf("reconcile report: %v", report.summary())
+					t.Errorf("reconcile took too long: %s > %s", runDur, maxReconcileDuration)
+				}
+
+				errs := checkSubnetReflectors(nodes, report.reflectorsPerSubnet)
+				for _, err := range errs {
+					t.Error(err)
+				}
+
+				if report.actionCnt[actionActivate] > 0 || report.actionCnt[actionDeactivate] > 0 {
+					if !reconcileNeeded {
+						t.Errorf("reconciler made changes when not needed: these tests indicate it did not need to activate/deactivate any reflectors on this run:\n%s", report.summary())
 					}
 				}
-
-				if nodeErrCnt[node.Name] >= maxFailedReflectorChecks {
-					t.Errorf("node %s: reflector check hit max fail count", node.Name)
-					nodeErrCnt[node.Name] = 0
-				}
-			}
-			for network := range networks {
-				err := checkSubnetReflectors(t, client, network, reflectorsPerSubnet)
-				if err != nil {
-					networkErrCnt[network]++
-					t.Logf("%s: reflector check failed %d/%d times in a row: %v", network, networkErrCnt[network], maxFailedReflectorChecks, err)
-				} else {
-					if networkErrCnt[network] > 0 {
-						t.Logf("%s: reflector check success after %d consecutive failures, will reset fail counter", network, networkErrCnt[network])
-						networkErrCnt[network] = 0
-					}
-				}
-
-				if networkErrCnt[network] >= maxFailedReflectorChecks {
-					t.Errorf("%s: reflector check hit max fail count", network)
-					networkErrCnt[network] = 0
-				}
+			} else {
+				// Noop- this means reconcile pass has started
 			}
 		}
 	}

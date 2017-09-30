@@ -85,7 +85,10 @@ func main() {
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(stopCh <-chan struct{}) {
 				glog.Info("leaderelect: now leading!")
-				reconciler := nodereconciler.NewReconciler(clientset, crdClient)
+				reconciler, err := nodereconciler.NewReconciler(clientset, crdClient)
+				if err != nil {
+					glog.Fatalf("error creating reconciler: %v", err)
+				}
 				reconciler.Run(stopCh)
 				glog.Info("reconciler: run loop terminated! should no longer be leader")
 			},
